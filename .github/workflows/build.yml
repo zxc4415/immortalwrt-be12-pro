@@ -1,4 +1,5 @@
 name: Build ImmortalWrt for Tenda BE12 Pro
+
 on:
   workflow_dispatch:
     inputs:
@@ -10,22 +11,27 @@ on:
         description: 'SSH debug (true/false)'
         required: false
         default: 'false'
+
 env:
   REPO_URL: https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git
   REPO_BRANCH: 25.12-dev-wifi7
   CONFIG_FILE: config/defconfig-delta
   DIY_SH: diy.sh
+
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Free up disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/az
           sudo apt-get clean
           df -h
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -35,10 +41,12 @@ jobs:
             qemu-utils ccache
           git config --global user.name "Builder"
           git config --global user.email "builder@example.com"
+
       - name: Clone source
         run: |
           git clone -b ${{ env.REPO_BRANCH }} --single-branch --depth=1 \
             ${{ env.REPO_URL }} openwrt
+
       - name: Add third-party feeds
         working-directory: openwrt
         run: |
@@ -46,21 +54,42 @@ jobs:
           src-git kenzo https://github.com/kenzok8/openwrt-packages
           src-git small https://github.com/kenzok8/small
           EOF
+
       - name: Update & install feeds
         working-directory: openwrt
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
       - name: Clone OpenClash
         working-directory: openwrt
         run: |
           git clone --depth=1 -b ${{ github.event.inputs.openclash_branch || 'master' }} \
             https://github.com/vernesong/OpenClash.git /tmp/openclash
           cp -r /tmp/openclash/luci-app-openclash package/
+          echo "OpenClash version: $(grep -m1 'PKG_VERSION:=' package/luci-app-openclash/Makefile)"
+
+      # FIX: linkease/istore 已迁移至 istoreos/istore，且 luci-app-store 现在位于 luci/ 子目录。
+      # 旧路径 cp -r /tmp/istore/luci-app-store package/ 会静默失败，导致 iStore 从未被编进固件。
+      - name: Clone iStore (fixed path)
+        working-directory: openwrt
+        run: |
+          git clone --depth=1 https://github.com/istoreos/istore.git /tmp/istore
+          cp -r /tmp/istore/luci/luci-app-store \
+                /tmp/istore/luci/luci-lib-taskd \
+                /tmp/istore/luci/luci-lib-xterm \
+                /tmp/istore/luci/taskd \
+                package/
+          echo "--- installed iStore dirs ---"
+          ls -1 package/ | grep -E 'store|taskd'
+          test -f package/luci-app-store/Makefile || { echo "ERROR: luci-app-store missing"; exit 1; }
+          test -f package/taskd/Makefile || { echo "ERROR: taskd missing"; exit 1; }
+
       - name: Merge config
         working-directory: openwrt
         run: |
           base="defconfig/low-mem-512m/mt7987-mt7992-be7200.config"
+          test -f "$base" || { echo "ERROR: base config not found: $base"; exit 1; }
           sed -e '/routerich_be7200/d' \
               -e '/CONFIG_PACKAGE_luci-app-upnp/d' \
               -e '/CONFIG_PACKAGE_miniupnpd-nftables/d' \
@@ -69,35 +98,93 @@ jobs:
               "$base" > .config.base
           cat .config.base ${{ github.workspace }}/${{ env.CONFIG_FILE }} > .config
           rm -f .config.base
+
       - name: Set default LAN IP
         working-directory: openwrt
         run: |
           sed -i 's/192\.168\.1\.1/192.168.3.1/g' \
             package/base-files/files/bin/config_generate
+
       - name: Generate config
         working-directory: openwrt
         run: |
           make defconfig
-      - name: Show config summary
+
+      # 关键：make defconfig 会把无法满足的 CONFIG_PACKAGE_xxx=y 静默丢弃。
+      # 这里显式校验，防止再次出现"配置写了但没编进去"。
+      - name: Verify config kept required packages
         working-directory: openwrt
         run: |
-          grep -E '(openclash|istore|store)' .config || true
+          fail=0
+          for p in luci-app-openclash luci-app-store taskd luci-lib-taskd \
+                   luci-lib-xterm mihomo v2ray-geoip; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y$" .config; then
+              echo "CONFIG OK   $p"
+            else
+              echo "CONFIG MISS $p  <-- make defconfig dropped it"
+              fail=1
+            fi
+          done
+          if [ $fail -ne 0 ]; then
+            echo "=== 相关配置行 ==="
+            grep -E "PACKAGE_(luci-app-store|taskd|mihomo|v2ray-geo|luci-lib)" .config || true
+            exit 1
+          fi
+
       - name: Download packages
         working-directory: openwrt
         run: |
           make download -j$(nproc)
+
       - name: Compile firmware
         working-directory: openwrt
         run: |
           echo "=== Start compiling ==="
           make -j$(nproc) || make -j1 V=s
           echo "=== Compilation done ==="
+
+      - name: Verify built manifest
+        working-directory: openwrt
+        run: |
+          M=$(ls bin/targets/mediatek/filogic/*.manifest 2>/dev/null | head -1)
+          test -n "$M" || { echo "ERROR: no manifest produced"; exit 1; }
+          echo "manifest: $M"
+          fail=0
+          for p in luci-app-openclash luci-app-store mihomo v2ray-geoip \
+                   taskd luci-lib-taskd luci-theme-argon luci-i18n-base-zh-cn \
+                   kmod-mt7992 kmod-mt_wifi7; do
+            if grep -q "^${p} " "$M"; then
+              echo "OK   $p"
+            else
+              echo "MISS $p"
+              fail=1
+            fi
+          done
+          echo "--- total packages: $(wc -l < "$M") ---"
+          if [ $fail -ne 0 ]; then
+            echo "::error::Some required packages are missing from the firmware"
+            exit 1
+          fi
+
       - name: Upload firmware
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-be12-pro-${{ github.run_number }}
+          name: immortalwrt-be12-pro-final-${{ github.run_number }}
           path: openwrt/bin/targets/mediatek/filogic/*
           retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload config snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-config-${{ github.run_number }}
+          path: |
+            openwrt/.config
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: SSH debug
         if: github.event.inputs.ssh == 'true'
         uses: mxschmitt/action-tmate@v3
