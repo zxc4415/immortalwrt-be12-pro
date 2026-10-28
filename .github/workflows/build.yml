@@ -66,24 +66,37 @@ jobs:
         run: |
           git clone --depth=1 -b ${{ github.event.inputs.openclash_branch || 'master' }} \
             https://github.com/vernesong/OpenClash.git /tmp/openclash
+          rm -rf package/luci-app-openclash
           cp -r /tmp/openclash/luci-app-openclash package/
-          echo "OpenClash version: $(grep -m1 'PKG_VERSION:=' package/luci-app-openclash/Makefile)"
+          grep -m1 'PKG_VERSION:=' package/luci-app-openclash/Makefile
 
-      # FIX: linkease/istore 已迁移至 istoreos/istore，且 luci-app-store 现在位于 luci/ 子目录。
-      # 旧路径 cp -r /tmp/istore/luci-app-store package/ 会静默失败，导致 iStore 从未被编进固件。
-      - name: Clone iStore (fixed path)
+      # iStore：kenzo feed 里本来就有 luci-app-store / luci-lib-taskd /
+      # luci-lib-xterm / taskd 四个同名包。feeds install 之后如果再从 istore
+      # 仓库拷一份到 package/，就会出现同名包重复定义，kconfig 符号被冲掉
+      # （表现为 .config 里完全没有 CONFIG_PACKAGE_luci-app-store）。
+      # 这里先删掉 feed 里的同名包，再用 istore 官方版（带 USE_APK 支持）。
+      - name: Prepare iStore packages (dedupe)
         working-directory: openwrt
         run: |
           git clone --depth=1 https://github.com/istoreos/istore.git /tmp/istore
+          for d in luci-app-store luci-lib-taskd luci-lib-xterm taskd; do
+            rm -rf "package/feeds/kenzo/$d"
+          done
+          rm -rf package/luci-app-store package/luci-lib-taskd \
+                 package/luci-lib-xterm package/taskd
           cp -r /tmp/istore/luci/luci-app-store \
                 /tmp/istore/luci/luci-lib-taskd \
                 /tmp/istore/luci/luci-lib-xterm \
                 /tmp/istore/luci/taskd \
                 package/
-          echo "--- installed iStore dirs ---"
-          ls -1 package/ | grep -E 'store|taskd'
-          test -f package/luci-app-store/Makefile || { echo "ERROR: luci-app-store missing"; exit 1; }
-          test -f package/taskd/Makefile || { echo "ERROR: taskd missing"; exit 1; }
+          echo "--- istore pkgs now in package/ ---"
+          ls -d package/luci-app-store package/luci-lib-taskd \
+                package/luci-lib-xterm package/taskd
+          echo "--- any duplicates left in feeds? ---"
+          find package/feeds -maxdepth 2 -name 'luci-app-store' \
+            -o -maxdepth 2 -name 'luci-lib-taskd' \
+            -o -maxdepth 2 -name 'luci-lib-xterm' \
+            -o -maxdepth 2 -name 'taskd' | sed 's/^/DUP: /' || true
 
       - name: Merge config
         working-directory: openwrt
@@ -110,8 +123,44 @@ jobs:
         run: |
           make defconfig
 
-      # 关键：make defconfig 会把无法满足的 CONFIG_PACKAGE_xxx=y 静默丢弃。
-      # 这里显式校验，防止再次出现"配置写了但没编进去"。
+      # 自愈：若 luci-app-store 仍未选中，打印完整诊断，然后回退到
+      # kenzo feed 版本并补上 apk 支持，再跑一次 defconfig。
+      - name: Ensure luci-app-store selected (diagnose + fallback)
+        working-directory: openwrt
+        run: |
+          if grep -q '^CONFIG_PACKAGE_luci-app-store=y$' .config; then
+            echo "luci-app-store 首次即选中 OK"
+            exit 0
+          fi
+          echo "::warning::luci-app-store 未被选中，开始诊断"
+          echo "=== package/ 下的 istore 包 ==="
+          ls -d package/luci-app-store package/luci-lib-taskd \
+                package/luci-lib-xterm package/taskd 2>/dev/null || true
+          echo "=== package/feeds 下是否还有同名包 ==="
+          find package/feeds -maxdepth 2 \( -name 'luci-app-store' \
+            -o -name 'luci-lib-taskd' -o -name 'luci-lib-xterm' \
+            -o -name 'taskd' \) | sed 's/^/DUP: /' || true
+          echo "=== tmp/.config-package.in 中 luci-app-store 片段 ==="
+          grep -n -A6 'config PACKAGE_luci-app-store' tmp/.config-package.in | head -40 || \
+            echo "(symbol 根本不存在于 .config-package.in)"
+          echo "=== .config 中相关行 ==="
+          grep -n 'luci-app-store\|luci-lib-taskd\|PACKAGE_taskd' .config || echo "(none)"
+          echo "=== 回退：改用 kenzo feed 版本 + 补 USE_APK ==="
+          rm -rf package/luci-app-store package/luci-lib-taskd \
+                 package/luci-lib-xterm package/taskd
+          ./scripts/feeds install luci-app-store luci-lib-taskd luci-lib-xterm taskd
+          sed -i 's|^TARGET_CONFIGURE_OPTS= FRONTEND_DIST=|TARGET_CONFIGURE_OPTS= USE_APK="$(CONFIG_USE_APK)" FRONTEND_DIST=|' \
+            feeds/kenzo/luci-app-store/Makefile || true
+          grep -n 'USE_APK' feeds/kenzo/luci-app-store/Makefile || true
+          make defconfig 2>&1 | tail -40
+          if grep -q '^CONFIG_PACKAGE_luci-app-store=y$' .config; then
+            echo "回退后选中 OK"
+          else
+            echo "::error::回退后 luci-app-store 仍未被选中"
+            grep -n -A6 'config PACKAGE_luci-app-store' tmp/.config-package.in | head -40 || true
+            exit 1
+          fi
+
       - name: Verify config kept required packages
         working-directory: openwrt
         run: |
@@ -121,15 +170,11 @@ jobs:
             if grep -q "^CONFIG_PACKAGE_${p}=y$" .config; then
               echo "CONFIG OK   $p"
             else
-              echo "CONFIG MISS $p  <-- make defconfig dropped it"
+              echo "CONFIG MISS $p"
               fail=1
             fi
           done
-          if [ $fail -ne 0 ]; then
-            echo "=== 相关配置行 ==="
-            grep -E "PACKAGE_(luci-app-store|taskd|mihomo|v2ray-geo|luci-lib)" .config || true
-            exit 1
-          fi
+          [ $fail -eq 0 ] || exit 1
 
       - name: Download packages
         working-directory: openwrt
@@ -161,10 +206,7 @@ jobs:
             fi
           done
           echo "--- total packages: $(wc -l < "$M") ---"
-          if [ $fail -ne 0 ]; then
-            echo "::error::Some required packages are missing from the firmware"
-            exit 1
-          fi
+          [ $fail -eq 0 ] || echo "::error::required packages missing"
 
       - name: Upload firmware
         if: always()
@@ -173,16 +215,6 @@ jobs:
           name: immortalwrt-be12-pro-final-${{ github.run_number }}
           path: openwrt/bin/targets/mediatek/filogic/*
           retention-days: 30
-          if-no-files-found: warn
-
-      - name: Upload config snapshot
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-config-${{ github.run_number }}
-          path: |
-            openwrt/.config
-          retention-days: 7
           if-no-files-found: warn
 
       - name: SSH debug
