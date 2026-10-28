@@ -13,8 +13,25 @@ CONFIG_PACKAGE_luci-i18n-turboacc-mtk-zh-cn=y
 # OpenClash
 CONFIG_PACKAGE_luci-app-openclash=y
 
-# iStore 软件中心
+# clash 内核 + GeoIP 数据
+# OpenClash 0.48+ 的 DEPENDS 已不再包含 mihomo，必须显式声明，否则固件里没有内核，
+# 只能靠 OpenClash 运行时从 GitHub 拉取（国内网络经常失败）。
+CONFIG_PACKAGE_mihomo=y
+CONFIG_PACKAGE_v2ray-geoip=y
+
+# iStore 软件中心 + 其依赖链
+# luci-app-store 依赖: curl tar libuci-lua mount-utils luci-lib-taskd
+# luci-lib-taskd 依赖: luci-lib-xterm taskd
+# taskd 依赖: procd script-utils coreutils coreutils-stty
 CONFIG_PACKAGE_luci-app-store=y
+CONFIG_PACKAGE_luci-lib-taskd=y
+CONFIG_PACKAGE_luci-lib-xterm=y
+CONFIG_PACKAGE_taskd=y
+CONFIG_PACKAGE_libuci-lua=y
+CONFIG_PACKAGE_tar=y
+CONFIG_PACKAGE_mount-utils=y
+CONFIG_PACKAGE_script-utils=y
+CONFIG_PACKAGE_coreutils-stty=y
 
 # 常用依赖（OpenClash 运行需要）
 CONFIG_PACKAGE_dnsmasq-full=y
