@@ -1,0 +1,81 @@
+name: DEBUG iStore deps
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libelf-dev libncurses-dev \
+            libssl-dev python3-distutils rsync unzip zlib1g-dev file wget
+          git config --global user.name B
+          git config --global user.email b@e.com
+
+      - name: Clone & feeds
+        run: |
+          git clone -b 25.12-dev-wifi7 --single-branch --depth=1 \
+            https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git openwrt
+          cd openwrt
+          cat >> feeds.conf.default << 'EOF'
+          src-git kenzo https://github.com/kenzok8/openwrt-packages
+          src-git small https://github.com/kenzok8/small
+          EOF
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Merge config
+        run: |
+          cd openwrt
+          base="defconfig/low-mem-512m/mt7987-mt7992-be7200.config"
+          sed -e '/routerich_be7200/d' \
+              -e '/CONFIG_PACKAGE_luci-app-upnp/d' \
+              -e '/CONFIG_PACKAGE_miniupnpd-nftables/d' \
+              -e '/CONFIG_PACKAGE_luci-i18n-upnp-zh-cn/d' \
+              -e '/CONFIG_PACKAGE_luci-app-eqos-mtk/d' \
+              "$base" > .config.base
+          cat .config.base ${{ github.workspace }}/config/defconfig-delta > .config
+          rm -f .config.base
+          make defconfig
+
+      - name: Dump luci-app-store full kconfig block
+        run: |
+          cd openwrt
+          echo "########## config PACKAGE_luci-app-store 完整块 ##########"
+          awk '/^\t*config PACKAGE_luci-app-store$/{f=1} f{print; if(/^$/ && NR>1 && f) c++; if(c>0) exit}' tmp/.config-package.in
+          echo
+          echo "########## 用 -A45 再抓一次 ##########"
+          grep -n -A45 'config PACKAGE_luci-app-store' tmp/.config-package.in | head -50
+
+      - name: Dump related symbol values
+        run: |
+          cd openwrt
+          echo "########## .config 中相关符号 ##########"
+          grep -E 'CONFIG_(PACKAGE_(luci|luci-base|luci-compat|curl|tar|libuci-lua|mount-utils|luci-lib-taskd|luci-lib-xterm|taskd|xz-utils|libcurl|libcurl4)|USE_GLIBC|LIBCURL_LDAP|TAR_XZ|ALL|USE_APK)\b' .config | sort | head -60
+          echo
+          echo "########## tmp/.config-package.in 中 luci-app-store 其它出现处 ##########"
+          grep -n 'luci-app-store' tmp/.config-package.in | head -20
+          echo
+          echo "########## mount-utils / libuci-lua 包是否存在 ##########"
+          grep -n 'config PACKAGE_mount-utils\|config PACKAGE_libuci-lua\|config PACKAGE_luci-lib-taskd' tmp/.config-package.in | head
+
+      - name: Try forcing selection
+        run: |
+          cd openwrt
+          echo "########## 尝试 1：直接追加并 olddefconfig ##########"
+          grep -v 'CONFIG_PACKAGE_luci-app-store' .config > .config.tmp
+          echo 'CONFIG_PACKAGE_luci-app-store=y' >> .config.tmp
+          mv .config.tmp .config
+          make olddefconfig 2>&1 | tail -10
+          echo "--- 结果 ---"
+          grep -n 'luci-app-store' .config || echo "仍然不出现 -> 符号不可见（deps 未满足）"
+          echo
+          echo "########## 尝试 2：查看 kconfig 对它的可见性 ##########"
+          ls scripts/kconfig/ 2>/dev/null
+          ./scripts/kconfig/conf --help 2>&1 | head -5 || echo "no conf binary"
