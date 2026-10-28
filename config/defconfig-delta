@@ -30,6 +30,9 @@ CONFIG_PACKAGE_taskd=y
 CONFIG_PACKAGE_libuci-lua=y
 CONFIG_PACKAGE_tar=y
 CONFIG_PACKAGE_mount-utils=y
+# luci-app-store 的 kconfig 里有: depends on !(PACKAGE_TAR_XZ) || PACKAGE_xz-utils
+# tar 若带 XZ 支持而 xz-utils 未选中，该条件为假，整个符号会被 kconfig 隐藏
+CONFIG_PACKAGE_xz-utils=y
 CONFIG_PACKAGE_script-utils=y
 CONFIG_PACKAGE_coreutils-stty=y
 
