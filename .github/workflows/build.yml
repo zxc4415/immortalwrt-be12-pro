@@ -123,43 +123,28 @@ jobs:
         run: |
           make defconfig
 
-      # 自愈：若 luci-app-store 仍未选中，打印完整诊断，然后回退到
-      # kenzo feed 版本并补上 apk 支持，再跑一次 defconfig。
-      - name: Ensure luci-app-store selected (diagnose + fallback)
+      # 若 luci-app-store 仍未选中，精确打印每个 kconfig 条件符号的值
+      - name: Ensure luci-app-store selected
         working-directory: openwrt
         run: |
           if grep -q '^CONFIG_PACKAGE_luci-app-store=y$' .config; then
-            echo "luci-app-store 首次即选中 OK"
+            echo "luci-app-store 已选中 OK"
             exit 0
           fi
-          echo "::warning::luci-app-store 未被选中，开始诊断"
-          echo "=== package/ 下的 istore 包 ==="
-          ls -d package/luci-app-store package/luci-lib-taskd \
-                package/luci-lib-xterm package/taskd 2>/dev/null || true
-          echo "=== package/feeds 下是否还有同名包 ==="
-          find package/feeds -maxdepth 2 \( -name 'luci-app-store' \
-            -o -name 'luci-lib-taskd' -o -name 'luci-lib-xterm' \
-            -o -name 'taskd' \) | sed 's/^/DUP: /' || true
-          echo "=== tmp/.config-package.in 中 luci-app-store 片段 ==="
-          grep -n -A6 'config PACKAGE_luci-app-store' tmp/.config-package.in | head -40 || \
-            echo "(symbol 根本不存在于 .config-package.in)"
-          echo "=== .config 中相关行 ==="
-          grep -n 'luci-app-store\|luci-lib-taskd\|PACKAGE_taskd' .config || echo "(none)"
-          echo "=== 回退：改用 kenzo feed 版本 + 补 USE_APK ==="
-          rm -rf package/luci-app-store package/luci-lib-taskd \
-                 package/luci-lib-xterm package/taskd
-          ./scripts/feeds install luci-app-store luci-lib-taskd luci-lib-xterm taskd
-          sed -i 's|^TARGET_CONFIGURE_OPTS= FRONTEND_DIST=|TARGET_CONFIGURE_OPTS= USE_APK="$(CONFIG_USE_APK)" FRONTEND_DIST=|' \
-            feeds/kenzo/luci-app-store/Makefile || true
-          grep -n 'USE_APK' feeds/kenzo/luci-app-store/Makefile || true
-          make defconfig 2>&1 | tail -40
-          if grep -q '^CONFIG_PACKAGE_luci-app-store=y$' .config; then
-            echo "回退后选中 OK"
-          else
-            echo "::error::回退后 luci-app-store 仍未被选中"
-            grep -n -A6 'config PACKAGE_luci-app-store' tmp/.config-package.in | head -40 || true
-            exit 1
-          fi
+          echo "::error::luci-app-store 未被选中，以下为诊断信息"
+          echo "=== 条件符号精确值 ==="
+          for s in PACKAGE_tar PACKAGE_TAR_XZ PACKAGE_xz-utils PACKAGE_libc \
+                   PACKAGE_curl PACKAGE_libuci-lua PACKAGE_luci-lib-taskd \
+                   PACKAGE_luci-lua-runtime PACKAGE_mount-utils \
+                   LIBCURL_LDAP USE_GLIBC; do
+            v=$(grep -E "^(CONFIG_${s}=|# CONFIG_${s} is not set)" .config | head -1)
+            echo "  ${s} = ${v:-<未出现于 .config>}"
+          done
+          echo "=== kconfig 块 ==="
+          grep -n -A18 'config PACKAGE_luci-app-store$' tmp/.config-package.in | head -22
+          echo "=== 是否存在多个同名包 ==="
+          find package -maxdepth 3 -name 'luci-app-store' 2>/dev/null || true
+          exit 1
 
       - name: Verify config kept required packages
         working-directory: openwrt
